@@ -1,0 +1,14 @@
+.env
+*.env
+youtube_token.json
+client_secret.json
+__pycache__/
+*.pyc
+.venv/
+venv/
+videos/new/*
+videos/processed/*
+videos/posted/*
+!videos/new/.gitkeep
+!videos/processed/.gitkeep
+!videos/posted/.gitkeep
