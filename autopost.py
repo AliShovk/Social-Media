@@ -4,7 +4,9 @@ import json
 import os
 import random
 import shutil
+from html.parser import HTMLParser
 from pathlib import Path
+from urllib.parse import urljoin, urlparse, unquote
 
 import cv2
 import requests
@@ -14,11 +16,16 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload
 from vk_api.exceptions import ApiError
 
 
 load_dotenv()
+
+
+def env_value(name, default=None):
+    return os.getenv(name) or default
 
 
 VK_USER_TOKEN = os.getenv("VK_USER_TOKEN")
@@ -29,9 +36,12 @@ OK_ACCESS_TOKEN = os.getenv("OK_ACCESS_TOKEN")
 OK_APPLICATION_KEY = os.getenv("OK_APPLICATION_KEY")
 OK_APPLICATION_SECRET_KEY = os.getenv("OK_APPLICATION_SECRET_KEY")
 OK_GROUP_ID = os.getenv("OK_GROUP_ID")
-YOUTUBE_CLIENT_SECRETS_FILE = os.getenv("YOUTUBE_CLIENT_SECRETS_FILE", "client_secret.json")
-YOUTUBE_TOKEN_FILE = os.getenv("YOUTUBE_TOKEN_FILE", "youtube_token.json")
-YOUTUBE_PRIVACY_STATUS = os.getenv("YOUTUBE_PRIVACY_STATUS", "public")
+YOUTUBE_CLIENT_SECRETS_FILE = env_value("YOUTUBE_CLIENT_SECRETS_FILE", "client_secret.json")
+YOUTUBE_TOKEN_FILE = env_value("YOUTUBE_TOKEN_FILE", "youtube_token.json")
+YOUTUBE_PRIVACY_STATUS = env_value("YOUTUBE_PRIVACY_STATUS", "public")
+SOURCE_VIDEO_URL = env_value("SOURCE_VIDEO_URL")
+SOURCE_MEDIA_BASE_URL = env_value("SOURCE_MEDIA_BASE_URL")
+DOWNLOAD_HISTORY_FILE = Path(env_value("DOWNLOAD_HISTORY_FILE", "downloaded_videos.json"))
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 SITE_URL = "https://masterhacks.ru/"
 SITE_CTA = "👇 Переходите на сайт 👇"
@@ -60,6 +70,134 @@ class OkAutoposterError(Exception):
 
 class YoutubeAutoposterError(Exception):
     pass
+
+
+class VideoLinkParser(HTMLParser):
+    def __init__(self, base_url):
+        super().__init__()
+        self.base_url = base_url
+        self.links = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        for name in ("href", "src"):
+            value = attrs.get(name)
+            if value:
+                url = urljoin(self.base_url, value)
+                if Path(urlparse(url).path).suffix.lower() in VIDEO_EXTENSIONS:
+                    self.links.append(url)
+
+
+def load_download_history():
+    if not DOWNLOAD_HISTORY_FILE.is_file():
+        return set()
+
+    try:
+        return set(json.loads(DOWNLOAD_HISTORY_FILE.read_text(encoding="utf-8")))
+    except json.JSONDecodeError:
+        return set()
+
+
+def save_download_history(history):
+    DOWNLOAD_HISTORY_FILE.write_text(
+        json.dumps(sorted(history), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def video_filename_from_url(url):
+    parsed = urlparse(url)
+    name = Path(unquote(parsed.path)).name
+    if name:
+        return name
+
+    digest = hashlib.md5(url.encode("utf-8")).hexdigest()
+    return f"{digest}.mp4"
+
+
+def find_source_video_urls(source_url):
+    response = requests.get(source_url, timeout=30)
+    response.raise_for_status()
+
+    content_type = response.headers.get("Content-Type", "").lower()
+    if Path(urlparse(source_url).path).suffix.lower() in VIDEO_EXTENSIONS:
+        return [source_url]
+
+    if "json" in content_type:
+        data = response.json()
+        if isinstance(data, list):
+            urls = []
+            for item in data:
+                if isinstance(item, str) and Path(urlparse(item).path).suffix.lower() in VIDEO_EXTENSIONS:
+                    urls.append(item)
+                elif isinstance(item, dict):
+                    filename = item.get("filename") or item.get("file") or item.get("url")
+                    file_type = item.get("type") or item.get("file_type")
+                    if not filename:
+                        continue
+
+                    if file_type and file_type != "video":
+                        continue
+
+                    if filename.startswith(("http://", "https://")):
+                        url = filename
+                    else:
+                        base_url = SOURCE_MEDIA_BASE_URL or urljoin(source_url, "media/")
+                        url = urljoin(base_url, filename)
+
+                    if Path(urlparse(url).path).suffix.lower() in VIDEO_EXTENSIONS:
+                        urls.append(url)
+
+            return list(dict.fromkeys(urls))
+
+    parser = VideoLinkParser(source_url)
+    parser.feed(response.text)
+    return list(dict.fromkeys(parser.links))
+
+
+def download_new_videos(source_url, target_folder):
+    if not source_url:
+        print("SOURCE_VIDEO_URL is not configured. Skipping video download.")
+        return []
+
+    target = Path(target_folder)
+    target.mkdir(parents=True, exist_ok=True)
+    history = load_download_history()
+    downloaded = []
+    video_urls = find_source_video_urls(source_url)
+
+    if not video_urls:
+        print(f"No source videos found: {source_url}")
+        return []
+
+    for video_url in video_urls:
+        if video_url in history:
+            continue
+
+        filename = video_filename_from_url(video_url)
+        destination = target / filename
+        if destination.exists():
+            history.add(video_url)
+            continue
+
+        print(f"Downloading video: {video_url}")
+        with requests.get(video_url, stream=True, timeout=60) as response:
+            response.raise_for_status()
+            with destination.open("wb") as file:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        file.write(chunk)
+
+        history.add(video_url)
+        downloaded.append(destination)
+        print(f"Downloaded video: {destination}")
+
+    save_download_history(history)
+
+    if not downloaded:
+        print("No new videos to download.")
+
+    return downloaded
 
 
 def load_hashtags():
@@ -686,29 +824,56 @@ def publish_videos_from_folder(folder_path, posted_folder_path, message, effect)
             publish_video_file = process_video_unique(video_file)
 
         print(f"Publishing video: {publish_video_file}")
-        result = publish_post(
-            message=post_message,
-            video_paths=[str(publish_video_file)],
-            video_title=shorten_video_title(video_file.stem),
-        )
-        telegram_result = send_video_to_telegram(publish_video_file, final_message)
-        ok_result = publish_video_to_ok(
-            publish_video_file,
-            final_message,
-            shorten_video_title(video_file.stem),
-        )
-        youtube_result = publish_video_to_youtube(
-            publish_video_file,
-            final_message,
-            shorten_video_title(video_file.stem),
-        )
+        result = None
+        telegram_result = None
+        ok_result = None
+        youtube_result = None
+
+        try:
+            result = publish_post(
+                message=post_message,
+                video_paths=[str(publish_video_file)],
+                video_title=shorten_video_title(video_file.stem),
+            )
+        except (ApiError, VkAutoposterError, requests.RequestException) as exc:
+            print(f"VK publish failed: {exc}")
+
+        try:
+            telegram_result = send_video_to_telegram(publish_video_file, final_message)
+        except (TelegramAutoposterError, requests.RequestException) as exc:
+            print(f"Telegram publish failed: {exc}")
+
+        try:
+            ok_result = publish_video_to_ok(
+                publish_video_file,
+                final_message,
+                shorten_video_title(video_file.stem),
+            )
+        except (OkAutoposterError, requests.RequestException) as exc:
+            print(f"Odnoklassniki publish failed: {exc}")
+
+        try:
+            youtube_result = publish_video_to_youtube(
+                publish_video_file,
+                final_message,
+                shorten_video_title(video_file.stem),
+            )
+        except (YoutubeAutoposterError, HttpError, OSError) as exc:
+            print(f"YouTube publish failed: {exc}")
+
+        if not any([result, telegram_result, ok_result, youtube_result]):
+            print("Video was not published to any platform. Source file was not moved.")
+            continue
+
         destination = posted_folder / video_file.name
 
         if destination.exists():
-            destination = posted_folder / f"{video_file.stem}_{result['post_id']}{video_file.suffix}"
+            suffix = result["post_id"] if result else "published"
+            destination = posted_folder / f"{video_file.stem}_{suffix}{video_file.suffix}"
 
         shutil.move(str(video_file), str(destination))
-        print(f"Post published successfully. VK post_id: {result['post_id']}")
+        if result:
+            print(f"Post published successfully. VK post_id: {result['post_id']}")
         if telegram_result:
             print(f"Telegram video published successfully. message_id: {telegram_result['message_id']}")
         if ok_result:
@@ -727,10 +892,14 @@ def main():
     parser.add_argument("--video-folder", default=None, help="Folder with new videos to publish.")
     parser.add_argument("--posted-folder", default="videos/posted", help="Folder where published videos will be moved.")
     parser.add_argument("--effect", choices=["none", "cartoon", "stylization", "unique"], default="none", help="Video effect before publishing.")
+    parser.add_argument("--download-first", action="store_true", help="Download new videos from SOURCE_VIDEO_URL before publishing.")
+    parser.add_argument("--source-url", default=SOURCE_VIDEO_URL, help="URL with source videos. Can be a video file, JSON list, or HTML directory page.")
     args = parser.parse_args()
 
     try:
         if args.video_folder:
+            if args.download_first:
+                download_new_videos(args.source_url, args.video_folder)
             publish_videos_from_folder(args.video_folder, args.posted_folder, args.message, args.effect)
             return
 

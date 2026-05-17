@@ -2,6 +2,7 @@
 *.env
 youtube_token.json
 client_secret.json
+downloaded_videos.json
 __pycache__/
 *.pyc
 .venv/
